@@ -54,6 +54,7 @@ from .simulation import SimulationContext
 from .types import ATTRIBUTE_AGENT_NAME, NOT_GIVEN, NotGivenOr
 from .utils import http_context, http_server, is_given
 from .utils.hw import get_cpu_monitor
+from .utils.hw.memory import get_available_memory
 from .version import __version__
 
 ASSIGNMENT_TIMEOUT = 7.5
@@ -148,6 +149,14 @@ class ServerEnvOption(Generic[T]):
 _default_load_threshold = ServerEnvOption(dev_default=math.inf, prod_default=0.7)
 _default_log_level = ServerEnvOption(dev_default="DEBUG", prod_default="INFO")
 _default_permissions = WorkerPermissions()
+
+
+def _validate_admission_options(memory_reserve_mb: float, max_active_jobs: int) -> None:
+    if not math.isfinite(memory_reserve_mb) or memory_reserve_mb < 0:
+        raise ValueError("worker_memory_reserve_mb must be finite and nonnegative")
+    if not isinstance(max_active_jobs, int) or max_active_jobs < 0:
+        raise ValueError("max_active_jobs must be a nonnegative integer")
+
 
 VALID_LOG_LEVELS = frozenset({"TRACE", "DEBUG", "INFO", "WARN", "ERROR", "CRITICAL"})
 
@@ -271,8 +280,23 @@ class ServerOptions:
     When None (default), multiprocess mode is disabled and only main process metrics are collected.
     Users can also set PROMETHEUS_MULTIPROC_DIR environment variable directly before starting the worker."""
 
+    worker_memory_reserve_mb: float = 0
+    """Available memory required per new job in MiB (0 disables memory admission).
+
+    Uses host availability bounded by visible cgroup limits on Linux. Pending
+    assignments reserve the same amount. Read failures reject new jobs. Applies
+    in development and production, alongside load_fnc/load_threshold. Does not
+    kill running jobs; job_memory_limit_mb controls per-process enforcement.
+    """
+    max_active_jobs: int = 0
+    """Maximum running jobs plus pending assignments (0 disables the limit).
+
+    Applies in development and production. Simulation bypasses admission limits.
+    """
+
     def __post_init__(self) -> None:
         self.log_level = _validate_and_normalize_log_level(self.log_level)
+        _validate_admission_options(self.worker_memory_reserve_mb, self.max_active_jobs)
 
     def validate_config(self, devmode: bool) -> None:
         load_threshold = ServerEnvOption.getvalue(self.load_threshold, devmode)
@@ -328,8 +352,15 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         prometheus_port: int | None = None,
         prometheus_multiproc_dir: str | None = None,
         log_level: str | ServerEnvOption[str] = _default_log_level,
+        worker_memory_reserve_mb: float = 0,
+        max_active_jobs: int = 0,
     ) -> None:
         super().__init__()
+        _validate_admission_options(worker_memory_reserve_mb, max_active_jobs)
+        self._worker_memory_reserve_mb = worker_memory_reserve_mb
+        self._max_active_jobs = max_active_jobs
+        self._available_memory: int | None = None
+        self._memory_read_failed = False
         self._ws_url = ws_url or os.environ.get("LIVEKIT_URL") or ""
         self._api_key = api_key or os.environ.get("LIVEKIT_API_KEY") or ""
         self._api_secret = api_secret or os.environ.get("LIVEKIT_API_SECRET") or ""
@@ -437,6 +468,8 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             setup_fnc=options.prewarm_fnc,
             load_fnc=options.load_fnc,
             log_level=options.log_level,
+            worker_memory_reserve_mb=options.worker_memory_reserve_mb,
+            max_active_jobs=options.max_active_jobs,
         )
         server.rtc_session(
             options.entrypoint_fnc,
@@ -872,9 +905,21 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         shutdown_process_timeout: NotGivenOr[float] = NOT_GIVEN,
         session_end_timeout: NotGivenOr[float] = NOT_GIVEN,
         initialize_process_timeout: NotGivenOr[float] = NOT_GIVEN,
+        worker_memory_reserve_mb: NotGivenOr[float] = NOT_GIVEN,
+        max_active_jobs: NotGivenOr[int] = NOT_GIVEN,
     ) -> None:
         if not self._closed:
             raise RuntimeError("cannot update options after starting the server")
+
+        memory_reserve = (
+            worker_memory_reserve_mb
+            if is_given(worker_memory_reserve_mb)
+            else self._worker_memory_reserve_mb
+        )
+        job_limit = max_active_jobs if is_given(max_active_jobs) else self._max_active_jobs
+        _validate_admission_options(memory_reserve, job_limit)
+        self._worker_memory_reserve_mb = memory_reserve
+        self._max_active_jobs = job_limit
 
         if is_given(ws_url):
             self._ws_url = ws_url
@@ -1333,12 +1378,45 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             job_load_estimate = load_threshold / max(default_idle, 1)
         return self._worker_load + self._reserved_slots * job_load_estimate
 
+    async def _refresh_worker_memory(self) -> None:
+        if self._worker_memory_reserve_mb == 0 or self._simulation:
+            return
+        try:
+            self._available_memory = await asyncio.get_running_loop().run_in_executor(
+                None, get_available_memory
+            )
+        except (OSError, ValueError, IndexError):
+            self._available_memory = None
+            if not self._memory_read_failed:
+                logger.warning(
+                    "cannot read worker memory capacity, rejecting new jobs", exc_info=True
+                )
+            self._memory_read_failed = True
+        else:
+            if self._memory_read_failed:
+                logger.info("worker memory capacity readings recovered")
+            self._memory_read_failed = False
+
+    def _has_resource_capacity(self) -> bool:
+        if self._max_active_jobs and (
+            len(self.active_jobs) + self._reserved_slots >= self._max_active_jobs
+        ):
+            return False
+        if self._worker_memory_reserve_mb:
+            required = self._worker_memory_reserve_mb * 1024 * 1024 * (self._reserved_slots + 1)
+            if self._available_memory is None or self._available_memory < required:
+                return False
+        return True
+
     def _is_available(self) -> bool:
         if self._draining:
             return False
 
         if self._simulation:
             return True
+
+        if not self._has_resource_capacity():
+            return False
 
         load_threshold = ServerEnvOption.getvalue(self._load_threshold, self._devmode)
         if math.isinf(load_threshold):
@@ -1353,6 +1431,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         If we get the job assigned, we start a new process."""
 
         await self._refresh_worker_load()
+        await self._refresh_worker_memory()
         if not self._is_available():
             availability_resp = agent.WorkerMessage()
             availability_resp.availability.job_id = msg.job.id
@@ -1497,9 +1576,13 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             await self._queue_msg(msg)
             return
 
+        await self._refresh_worker_memory()
+        job_cnt = len(self.active_jobs)
         load_threshold = ServerEnvOption.getvalue(self._load_threshold, self._devmode)
         effective_load = self._get_effective_load()
-        is_full = not self._simulation and effective_load >= load_threshold
+        is_full = not self._simulation and (
+            effective_load >= load_threshold or not self._has_resource_capacity()
+        )
         currently_available = not is_full and not self._draining
 
         status = (
@@ -1511,7 +1594,19 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         # only log if status has changed
         if self._previous_status != status and not self._draining:
             self._previous_status = status
-            extra = {"load": effective_load, "threshold": load_threshold}
+            extra: dict[str, Any] = {"load": effective_load, "threshold": load_threshold}
+            if self._worker_memory_reserve_mb or self._max_active_jobs:
+                extra.update(
+                    available_memory_mb=(
+                        self._available_memory / (1024 * 1024)
+                        if self._available_memory is not None
+                        else None
+                    ),
+                    worker_memory_reserve_mb=self._worker_memory_reserve_mb,
+                    max_active_jobs=self._max_active_jobs,
+                    active_jobs=job_cnt,
+                    reserved_slots=self._reserved_slots,
+                )
             if is_full:
                 logger.info("worker is at full capacity, marking as unavailable", extra=extra)
             else:
