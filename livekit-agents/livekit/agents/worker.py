@@ -287,6 +287,7 @@ class ServerOptions:
     assignments reserve the same amount. Read failures reject new jobs. Applies
     in development and production, alongside load_fnc/load_threshold. Does not
     kill running jobs; job_memory_limit_mb controls per-process enforcement.
+    Also bounds the prewarm pool target and exposes memory admission metrics.
     """
     max_active_jobs: int = 0
     """Maximum running jobs plus pending assignments (0 disables the limit).
@@ -696,7 +697,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                         agent_name=self._agent_name,
                         active_jobs=len(self.active_jobs),
                         sdk_version=__version__,
-                        worker_load=self._worker_load,
+                        worker_load=self._get_reported_load(),
                         protocol_version=WORKER_PROTOCOL_VERSION,
                     )
                     body = MessageToJson(worker_info, preserving_proto_field_name=True)
@@ -820,6 +821,10 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             self._proc_pool.on("process_started", _update_job_status)
             self._proc_pool.on("process_closed", _update_job_status)
             self._proc_pool.on("process_job_launched", _update_job_status)
+            # Apply resource budgets before the initial batch of prewarm processes.
+            await self._refresh_worker_memory()
+            self._update_idle_process_target()
+            self._update_load_metrics()
             await self._proc_pool.start()
 
             self._http_session = aiohttp.ClientSession(
@@ -840,31 +845,11 @@ class AgentServer(utils.EventEmitter[EventTypes]):
                 while True:
                     await interval.tick()
 
-                    self._worker_load = await self._invoke_load_fnc()
-
-                    telemetry.metrics._update_worker_load(self._worker_load)
+                    await self._refresh_worker_load()
                     if self._prometheus_multiproc_dir:
                         await asyncio.get_event_loop().run_in_executor(
                             None, telemetry.metrics._update_child_proc_count
                         )
-
-                    load_threshold = ServerEnvOption.getvalue(self._load_threshold, devmode)
-                    default_num_idle_processes = ServerEnvOption.getvalue(
-                        self._num_idle_processes, devmode
-                    )
-
-                    if not math.isinf(load_threshold):
-                        active_jobs = len(self.active_jobs)
-                        if active_jobs > 0:
-                            job_load = self._worker_load / len(self.active_jobs)
-                            if job_load > 0.0:
-                                available_load = max(load_threshold - self._worker_load, 0.0)
-                                available_job = min(
-                                    math.ceil(available_load / job_load), default_num_idle_processes
-                                )
-                                self._proc_pool.set_target_idle_processes(available_job)
-                        else:
-                            self._proc_pool.set_target_idle_processes(default_num_idle_processes)
 
             tasks = []
             self._load_task = asyncio.create_task(_load_task(), name="load_task")
@@ -1359,11 +1344,71 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         """Refresh _worker_load by running load_fnc. Used before availability checks
         so concurrent job requests see up-to-date load (fixes race with periodic interval).
         """
-        if self._load_fnc is None:
-            return
+        if self._load_fnc is not None:
+            self._worker_load = await self._invoke_load_fnc()
+        await self._refresh_worker_memory()
+        self._update_idle_process_target()
+        self._update_load_metrics()
 
-        self._worker_load = await self._invoke_load_fnc()
-        telemetry.metrics._update_worker_load(self._worker_load)
+    def _update_idle_process_target(self) -> None:
+        default_idle = ServerEnvOption.getvalue(self._num_idle_processes, self._devmode)
+        target = default_idle
+        update_target = False
+        active_jobs = len(self.active_jobs)
+        load_threshold = ServerEnvOption.getvalue(self._load_threshold, self._devmode)
+
+        # Preserve the existing CPU/custom-load policy, including its disabled
+        # and zero-load cases, when no resource admission limits are configured.
+        if not math.isinf(load_threshold):
+            if active_jobs:
+                job_load = self._worker_load / active_jobs
+                if job_load > 0.0:
+                    available_load = max(load_threshold - self._worker_load, 0.0)
+                    target = min(math.ceil(available_load / job_load), default_idle)
+                    update_target = True
+            else:
+                update_target = True
+
+        if not self._simulation:
+            if self._max_active_jobs:
+                target = min(
+                    target, max(0, self._max_active_jobs - active_jobs - self._reserved_slots)
+                )
+                update_target = True
+            if self._worker_memory_reserve_mb:
+                memory_slots = 0
+                if self._available_memory is not None:
+                    reserve_bytes = self._worker_memory_reserve_mb * 1024 * 1024
+                    if (
+                        self._available_memory
+                        >= (default_idle + self._reserved_slots) * reserve_bytes
+                    ):
+                        memory_slots = default_idle
+                    else:
+                        memory_slots = max(
+                            0,
+                            math.floor(self._available_memory / reserve_bytes)
+                            - self._reserved_slots,
+                        )
+                target = min(target, memory_slots)
+                update_target = True
+
+        if update_target:
+            self._proc_pool.set_target_idle_processes(target)
+
+    def _get_reported_load(self) -> float:
+        """Keep the raw callback load for CPU policy; expose resource saturation too."""
+        if not self._simulation and not self._has_resource_capacity():
+            return max(self._worker_load, 1.0)
+        return self._worker_load
+
+    def _update_load_metrics(self) -> None:
+        telemetry.metrics._update_worker_load(self._get_reported_load())
+        if self._worker_memory_reserve_mb and not self._simulation:
+            telemetry.metrics._update_worker_memory(
+                available_bytes=self._available_memory,
+                required_bytes=self._get_required_memory(),
+            )
 
     def _get_effective_load(self) -> float:
         """Current load including reserved slots (accepted but not yet launched)."""
@@ -1403,10 +1448,13 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         ):
             return False
         if self._worker_memory_reserve_mb:
-            required = self._worker_memory_reserve_mb * 1024 * 1024 * (self._reserved_slots + 1)
+            required = self._get_required_memory()
             if self._available_memory is None or self._available_memory < required:
                 return False
         return True
+
+    def _get_required_memory(self) -> float:
+        return self._worker_memory_reserve_mb * 1024 * 1024 * (self._reserved_slots + 1)
 
     def _is_available(self) -> bool:
         if self._draining:
@@ -1431,7 +1479,6 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         If we get the job assigned, we start a new process."""
 
         await self._refresh_worker_load()
-        await self._refresh_worker_memory()
         if not self._is_available():
             availability_resp = agent.WorkerMessage()
             availability_resp.availability.job_id = msg.job.id
@@ -1442,6 +1489,8 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         # Reserve a slot immediately so concurrent availability checks see updated
         # load before the user's request_fnc runs or calls accept().
         self._reserved_slots += 1
+        self._update_idle_process_target()
+        self._update_load_metrics()
         answered = False
 
         async def _on_reject(terminate: bool) -> None:
@@ -1533,6 +1582,7 @@ class AgentServer(utils.EventEmitter[EventTypes]):
         def _on_job_request_done(task: asyncio.Task[Any]) -> None:
             self._reserved_slots -= 1
             self._job_lifecycle_tasks.discard(task)
+            self._update_load_metrics()
 
         user_task = self._loop.create_task(_job_request_task(), name="job_request")
         self._job_lifecycle_tasks.add(user_task)
@@ -1577,6 +1627,8 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             return
 
         await self._refresh_worker_memory()
+        self._update_idle_process_target()
+        self._update_load_metrics()
         job_cnt = len(self.active_jobs)
         load_threshold = ServerEnvOption.getvalue(self._load_threshold, self._devmode)
         effective_load = self._get_effective_load()
@@ -1589,7 +1641,9 @@ class AgentServer(utils.EventEmitter[EventTypes]):
             agent.WorkerStatus.WS_AVAILABLE if currently_available else agent.WorkerStatus.WS_FULL
         )
 
-        update = agent.UpdateWorkerStatus(load=self._worker_load, status=status, job_count=job_cnt)
+        update = agent.UpdateWorkerStatus(
+            load=self._get_reported_load(), status=status, job_count=job_cnt
+        )
 
         # only log if status has changed
         if self._previous_status != status and not self._draining:
