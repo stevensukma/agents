@@ -72,6 +72,24 @@ both development and production; simulation mode bypasses them. They never kill
 running jobs. The separate `job_memory_warn_mb` and `job_memory_limit_mb` options
 still control per-process warnings and termination.
 
+The periodic load monitor refreshes memory every 0.5 seconds. Before the initial
+prewarm batch and on later updates, the idle-process target is bounded by the
+configured CPU policy, available memory divided by the per-job reserve (less
+pending reservations), and remaining job slots. The tightest limit wins. A read
+failure or exhausted memory budget sets the target to zero; recovery restores
+prewarming within the configured `num_idle_processes` ceiling. Existing warm
+processes are retained, matching CPU-based pool management: the target controls
+replenishment. Jobs that have already been assigned can still launch.
+
+When memory or the job cap blocks admission, the reported worker load is at least
+`1.0` in worker-status messages, `/worker`, and `lk_agents_worker_load`. The raw
+`load_fnc` value continues to drive CPU policy. With memory admission enabled,
+Prometheus also exposes:
+
+- `lk_agents_worker_memory_available_bytes`: current headroom, or `NaN` on a read failure.
+- `lk_agents_worker_memory_required_bytes`: reserve for pending assignments plus the next job.
+- `lk_agents_worker_memory_admission_blocked`: `1` for insufficient or unreadable memory, otherwise `0`.
+
 Choose the reserve and job cap for your workload, accounting for prewarmed
 processes and startup spikes. Admission is a headroom check, not a guarantee
 against later memory growth or an OOM in an existing job.
