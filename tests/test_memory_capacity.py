@@ -10,6 +10,7 @@ pytestmark = pytest.mark.unit
 
 @pytest.fixture
 def cgroup(tmp_path, monkeypatch):
+    memory._warn_unresolved_cgroups.cache_clear()
     membership = tmp_path / "cgroup"
     mountinfo = tmp_path / "mountinfo"
     monkeypatch.setattr(memory, "_CGROUP_FILE", membership)
@@ -32,7 +33,8 @@ def cgroup(tmp_path, monkeypatch):
         write_counters(current, v1=v1, limit=limit, usage=usage)
         return mount, current
 
-    return setup
+    yield setup
+    memory._warn_unresolved_cgroups.cache_clear()
 
 
 def write_counters(path, *, v1=False, limit="2000", usage="500"):
@@ -121,3 +123,32 @@ def test_non_linux_uses_host_without_proc_files(monkeypatch):
     monkeypatch.setattr(memory.sys, "platform", "darwin")
     monkeypatch.setattr(memory.psutil, "virtual_memory", lambda: SimpleNamespace(available=1234))
     assert memory.get_available_memory() == 1234
+
+
+@pytest.mark.parametrize("v1", [False, True])
+@pytest.mark.parametrize("member", ["/unmapped-worker", "/../../host/container"])
+def test_unmapped_cgroup_warns_once_and_uses_host(cgroup, caplog, v1, member):
+    cgroup(v1=v1, root="/pod", member=member)
+    assert memory.get_available_memory() == 10_000
+    assert memory.get_available_memory() == 10_000
+    warnings = [record for record in caplog.records if "could not resolve" in record.message]
+    assert len(warnings) == 1
+    assert "using host memory availability" in warnings[0].message
+    assert warnings[0].cgroup_paths == (member,)
+
+
+def test_unrelated_mount_does_not_warn_when_membership_is_resolved(cgroup, caplog):
+    cgroup(member="/worker")
+    original = memory._MOUNTINFO_FILE.read_text()
+    memory._MOUNTINFO_FILE.write_text(
+        "30 23 0:26 /unrelated /unrelated-mount rw - cgroup2 cgroup rw\n" + original
+    )
+    assert memory.get_available_memory() == 1500
+    assert "could not resolve" not in caplog.text
+
+
+def test_missing_cgroup_mount_warns_and_uses_host(cgroup, caplog):
+    cgroup()
+    memory._MOUNTINFO_FILE.write_text("29 23 0:26 / /tmp rw - tmpfs tmpfs rw\n")
+    assert memory.get_available_memory() == 10_000
+    assert "using host memory availability" in caplog.text
