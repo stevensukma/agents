@@ -35,6 +35,22 @@ CPU_LOAD_GAUGE = prometheus_client.Gauge(
     ["nodename"],
 )
 
+MEMORY_AVAILABLE_GAUGE = prometheus_client.Gauge(
+    "lk_agents_worker_memory_available_bytes",
+    "Available worker memory bounded by visible cgroup limits; NaN on read failure",
+    ["nodename"],
+)
+MEMORY_REQUIRED_GAUGE = prometheus_client.Gauge(
+    "lk_agents_worker_memory_required_bytes",
+    "Memory required for pending assignments plus one new job",
+    ["nodename"],
+)
+MEMORY_ADMISSION_BLOCKED_GAUGE = prometheus_client.Gauge(
+    "lk_agents_worker_memory_admission_blocked",
+    "Whether memory admission is blocked by insufficient headroom or a read failure",
+    ["nodename"],
+)
+
 
 # Note: set_function() is not supported in multiprocess mode.# We need to update this metric explicitly.
 def _update_child_proc_count() -> None:
@@ -49,6 +65,17 @@ def _update_child_proc_count() -> None:
 
 def _update_worker_load(worker_load: float) -> None:
     CPU_LOAD_GAUGE.labels(nodename=utils.nodename()).set(worker_load)
+
+
+def _update_worker_memory(*, available_bytes: int | None, required_bytes: float) -> None:
+    nodename = utils.nodename()
+    MEMORY_AVAILABLE_GAUGE.labels(nodename=nodename).set(
+        available_bytes if available_bytes is not None else float("nan")
+    )
+    MEMORY_REQUIRED_GAUGE.labels(nodename=nodename).set(required_bytes)
+    MEMORY_ADMISSION_BLOCKED_GAUGE.labels(nodename=nodename).set(
+        int(available_bytes is None or available_bytes < required_bytes)
+    )
 
 
 def job_started() -> None:

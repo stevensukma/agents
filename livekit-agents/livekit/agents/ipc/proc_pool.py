@@ -92,7 +92,7 @@ class ProcPool(utils.EventEmitter[EventTypes]):
         self._started = True
         self._main_atask = asyncio.create_task(self._main_task())
 
-        if self._default_num_idle_processes > 0:
+        if self._target_idle_processes > 0:
             # wait for the idle processes to be warmed up (by the main task)
             # use a timeout so start() doesn't block forever if initialization fails
             try:
@@ -193,6 +193,14 @@ class ProcPool(utils.EventEmitter[EventTypes]):
 
     def set_target_idle_processes(self, num_idle_processes: int) -> None:
         self._target_idle_processes = num_idle_processes
+        self._update_idle_ready()
+
+    def _update_idle_ready(self) -> None:
+        target = min(self._target_idle_processes, self._default_num_idle_processes)
+        if self._warmed_proc_queue.qsize() >= target:
+            self._idle_ready.set()
+        else:
+            self._idle_ready.clear()
 
     @property
     def target_idle_processes(self) -> int:
@@ -249,8 +257,7 @@ class ProcPool(utils.EventEmitter[EventTypes]):
                     await proc.initialize()
                     self.emit("process_ready", proc)
                     self._warmed_proc_queue.put_nowait(proc)
-                    if self._warmed_proc_queue.qsize() >= self._default_num_idle_processes:
-                        self._idle_ready.set()
+                    self._update_idle_ready()
 
                     initialized = True
         except Exception:
