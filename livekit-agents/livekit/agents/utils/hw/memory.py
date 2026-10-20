@@ -3,12 +3,24 @@ from __future__ import annotations
 import re
 import sys
 from collections.abc import Iterator
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
 import psutil
 
+from ...log import logger
+
 _CGROUP_FILE = Path("/proc/self/cgroup")
 _MOUNTINFO_FILE = Path("/proc/self/mountinfo")
+
+
+@lru_cache(maxsize=16)
+def _warn_unresolved_cgroups(paths: tuple[str, ...]) -> None:
+    logger.warning(
+        "could not resolve worker memory cgroup; using host memory availability "
+        "without the unresolved cgroup limits",
+        extra={"cgroup_paths": paths},
+    )
 
 
 def _unescape_mount_path(value: str) -> str:
@@ -17,6 +29,7 @@ def _unescape_mount_path(value: str) -> str:
 
 def _cgroup_memory_dirs() -> Iterator[tuple[Path, bool]]:
     memberships = {}
+    mapped = set[bool]()
     for line in _CGROUP_FILE.read_text().splitlines():
         _, controllers, path = line.split(":", 2)
         if not controllers or "memory" in controllers.split(","):
@@ -45,11 +58,16 @@ def _cgroup_memory_dirs() -> Iterator[tuple[Path, bool]]:
         # Some container runtimes report a path outside the visible namespace.
         # Only the mounted root (and its visible limits) is accessible then.
         current = mount_point if ".." in relative.parts else mount_point / relative
+        mapped.add(is_v1)
         while True:
             yield current, is_v1
             if current == mount_point:
                 break
             current = current.parent
+
+    unresolved = tuple(str(path) for is_v1, path in memberships.items() if is_v1 not in mapped)
+    if unresolved:
+        _warn_unresolved_cgroups(unresolved)
 
 
 def get_available_memory() -> int:
@@ -59,6 +77,8 @@ def get_available_memory() -> int:
     RSS. Checks the process's cgroup and each visible ancestor, including custom
     mount points. Unlimited cgroups and other platforms use host availability.
     Unreadable or malformed counters raise rather than overstate capacity.
+    Unresolved cgroup paths warn and fall back to host availability for those
+    limits. Warnings are suppressed for repeated occurrences of the same paths.
     """
     available = int(psutil.virtual_memory().available)
     if not sys.platform.startswith("linux"):
